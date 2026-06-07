@@ -25,6 +25,10 @@ serde_json = "1"
 ureq = { version = "3.3.0", features = ["json"] }
 tungstenite = "0.29.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSWindow", "NSButton", "NSView"] }
+
 [patch.crates-io]
 tauri = { git = "https://github.com/tauri-apps/tauri", branch = "feat/cef" }
 tauri-build = { git = "https://github.com/tauri-apps/tauri", branch = "feat/cef" }

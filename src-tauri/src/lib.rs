@@ -4,6 +4,26 @@ use tauri::{
     Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
 
+/// Hide the native traffic-light buttons (close/minimize/zoom).
+/// Must be called on the main thread. Safe to call in setup().
+#[cfg(target_os = "macos")]
+fn remove_traffic_lights(window: &tauri::WebviewWindow<tauri::Cef>) {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSWindow, NSWindowButton};
+
+    let Ok(raw) = window.ns_window() else { return };
+    let Some(ns_win) = (unsafe { Retained::<NSWindow>::retain(raw as _) }) else { return };
+    for btn in [
+        NSWindowButton::CloseButton,
+        NSWindowButton::MiniaturizeButton,
+        NSWindowButton::ZoomButton,
+    ] {
+        if let Some(b) = ns_win.standardWindowButton(btn) {
+            b.setHidden(true);
+        }
+    }
+}
+
 struct TrayShown(Mutex<bool>);
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
@@ -114,9 +134,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(TrayShown(Mutex::new(false)))
         .setup(|app| {
+            let app_handle = app.handle().clone();
+
             // Create tray browser hidden at startup so CDP target exists immediately.
-            // The agent can call navigate_tray() without any user interaction.
-            WebviewWindowBuilder::new(
+            let tray_win = WebviewWindowBuilder::new(
                 app,
                 "tray_browser",
                 WebviewUrl::External("about:blank".parse().unwrap()),
@@ -127,7 +148,18 @@ pub fn run() {
             .visible(false)
             .build()?;
 
-            let app_handle = app.handle().clone();
+            #[cfg(target_os = "macos")]
+            remove_traffic_lights(&tray_win);
+
+            // Intercept the close button: hide instead of destroy so the window
+            // (and its CDP target) stays alive for the agent.
+            let app_for_close = app_handle.clone();
+            tray_win.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    *app_for_close.state::<TrayShown>().0.lock().unwrap() = false;
+                }
+            });
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .on_tray_icon_event(move |_tray, event| {
@@ -164,10 +196,18 @@ pub fn run() {
 
                         let shown = app_handle.state::<TrayShown>();
                         let mut shown = shown.0.lock().unwrap();
-                        if *shown {
+                        let is_visible = window.is_visible().unwrap_or(false);
+                        let is_minimized = window.is_minimized().unwrap_or(false);
+
+                        if is_visible && !is_minimized {
+                            // Window is on screen — hide it
                             let _ = window.hide();
                             *shown = false;
                         } else {
+                            // Hidden or minimized via title bar — restore to tray position
+                            if is_minimized {
+                                let _ = window.unminimize();
+                            }
                             let _ = window.set_position(PhysicalPosition::new(x, y));
                             let _ = window.show();
                             let _ = window.set_focus();
