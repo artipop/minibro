@@ -151,6 +151,17 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             remove_traffic_lights(&tray_win);
 
+            // Main window: hide on close so the app keeps running (dock dot stays).
+            if let Some(main_win) = app.get_webview_window("main") {
+                let win = main_win.clone();
+                main_win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    }
+                });
+            }
+
             // Intercept the close button: hide instead of destroy so the window
             // (and its CDP target) stays alive for the agent.
             let app_for_close = app_handle.clone();
@@ -226,6 +237,18 @@ pub fn run() {
             cdp_get_html,
             cdp_list_targets,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Dock icon clicked while app is running — restore main window.
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(w) = app.get_webview_window("main") {
+                    if w.is_minimized().unwrap_or(false) {
+                        let _ = w.unminimize();
+                    }
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        });
 }
