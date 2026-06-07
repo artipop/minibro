@@ -4,23 +4,133 @@ use tauri::{
     Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
 
-struct TrayUrl(Mutex<String>);
+struct TrayShown(Mutex<bool>);
+
+// ── Tauri commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn set_tray_url(state: tauri::State<TrayUrl>, url: String) {
-    *state.0.lock().unwrap() = url;
+fn navigate_tray(app: tauri::AppHandle<tauri::Cef>, url: String) -> Result<(), String> {
+    let window = app
+        .get_webview_window("tray_browser")
+        .ok_or("tray_browser not found")?;
+    let parsed = url.parse::<tauri::Url>().map_err(|e| e.to_string())?;
+    window.navigate(parsed).map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+fn eval_in_tray(app: tauri::AppHandle<tauri::Cef>, script: String) -> Result<(), String> {
+    let window = app
+        .get_webview_window("tray_browser")
+        .ok_or("tray_browser not found")?;
+    window.eval(&script).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cdp_eval(script: String) -> Result<String, String> {
+    let ws_url = cdp_find_tray_ws()?;
+    let (mut ws, _) =
+        tungstenite::connect(&ws_url).map_err(|e| format!("WS connect failed: {e}"))?;
+
+    let msg = serde_json::json!({
+        "id": 1,
+        "method": "Runtime.evaluate",
+        "params": { "expression": script, "returnByValue": true, "awaitPromise": true }
+    });
+    ws.send(tungstenite::Message::Text(msg.to_string().into()))
+        .map_err(|e| format!("WS send: {e}"))?;
+
+    let response = ws.read().map_err(|e| format!("WS read: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&response.to_string()).map_err(|e| e.to_string())?;
+
+    if let Some(exc) = json["result"]["exceptionDetails"].as_object() {
+        return Err(format!("JS exception: {exc:?}"));
+    }
+
+    let val = &json["result"]["result"]["value"];
+    Ok(if val.is_string() {
+        val.as_str().unwrap().to_string()
+    } else {
+        val.to_string()
+    })
+}
+
+#[tauri::command]
+fn cdp_get_html() -> Result<String, String> {
+    cdp_eval("document.documentElement.outerHTML".into())
+}
+
+#[tauri::command]
+fn cdp_list_targets() -> Result<String, String> {
+    let targets: serde_json::Value = ureq::get("http://localhost:9229/json")
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_body()
+        .read_to_string()
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))?;
+    Ok(serde_json::to_string_pretty(&targets).unwrap())
+}
+
+// ── CDP helpers ───────────────────────────────────────────────────────────────
+
+fn cdp_find_tray_ws() -> Result<String, String> {
+    let targets: serde_json::Value = ureq::get("http://localhost:9229/json")
+        .call()
+        .map_err(|e| format!("CDP HTTP failed: {e}"))?
+        .into_body()
+        .read_to_string()
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))?;
+
+    let arr = targets.as_array().ok_or("CDP response is not array")?;
+
+    // Main Tauri window is at localhost:1420 — skip it; everything else is tray browser
+    let target = arr
+        .iter()
+        .find(|t| {
+            let url = t["url"].as_str().unwrap_or("");
+            t["type"].as_str() == Some("page")
+                && !url.starts_with("tauri://")
+                && !url.starts_with("http://localhost:1420")
+        })
+        .ok_or_else(|| {
+            let urls: Vec<&str> = arr.iter().filter_map(|t| t["url"].as_str()).collect();
+            format!("No tray browser target found. Targets: {urls:?}")
+        })?;
+
+    target["webSocketDebuggerUrl"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "No webSocketDebuggerUrl".to_string())
+}
+
+// ── App entry ─────────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::<tauri::Cef>::new()
         .command_line_args([("remote-debugging-port", Some("9229"))])
         .plugin(tauri_plugin_opener::init())
-        .manage(TrayUrl(Mutex::new(String::new())))
+        .manage(TrayShown(Mutex::new(false)))
         .setup(|app| {
+            // Create tray browser hidden at startup so CDP target exists immediately.
+            // The agent can call navigate_tray() without any user interaction.
+            WebviewWindowBuilder::new(
+                app,
+                "tray_browser",
+                WebviewUrl::External("about:blank".parse().unwrap()),
+            )
+            .decorations(false)
+            .always_on_top(true)
+            .inner_size(800.0, 600.0)
+            .visible(false)
+            .build()?;
+
+            let app_handle = app.handle().clone();
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .on_tray_icon_event(|tray, event| {
+                .on_tray_icon_event(move |_tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
@@ -28,12 +138,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        let url_str = app.state::<TrayUrl>().0.lock().unwrap().clone();
-                        if url_str.is_empty() {
-                            return;
-                        }
-                        let Ok(parsed) = url_str.parse::<tauri::Url>() else {
+                        let Some(window) = app_handle.get_webview_window("tray_browser") else {
                             return;
                         };
 
@@ -54,39 +159,19 @@ pub fn run() {
                             tauri::Size::Logical(s) => s.height,
                         };
 
-                        // Center window horizontally under tray icon
-                        let x_phys = icon_x + icon_w / 2.0 - 400.0;
-                        let y_phys = icon_y + icon_h;
+                        let x = (icon_x + icon_w / 2.0 - 400.0) as i32;
+                        let y = (icon_y + icon_h) as i32;
 
-                        if let Some(window) = app.get_webview_window("tray_browser") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.navigate(parsed);
-                                let _ = window.set_position(PhysicalPosition::new(
-                                    x_phys as i32,
-                                    y_phys as i32,
-                                ));
-                                let _ = window.show();
-                                let _ = window.set_focus();
-                            }
+                        let shown = app_handle.state::<TrayShown>();
+                        let mut shown = shown.0.lock().unwrap();
+                        if *shown {
+                            let _ = window.hide();
+                            *shown = false;
                         } else {
-                            let scale = app
-                                .primary_monitor()
-                                .ok()
-                                .flatten()
-                                .map(|m| m.scale_factor())
-                                .unwrap_or(1.0);
-                            let _ = WebviewWindowBuilder::new(
-                                app,
-                                "tray_browser",
-                                WebviewUrl::External(parsed),
-                            )
-                            .decorations(false)
-                            .always_on_top(true)
-                            .inner_size(800.0, 600.0)
-                            .position(x_phys / scale, y_phys / scale)
-                            .build();
+                            let _ = window.set_position(PhysicalPosition::new(x, y));
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                            *shown = true;
                         }
                     }
                 })
@@ -94,7 +179,13 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![set_tray_url])
+        .invoke_handler(tauri::generate_handler![
+            navigate_tray,
+            eval_in_tray,
+            cdp_eval,
+            cdp_get_html,
+            cdp_list_targets,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
