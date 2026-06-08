@@ -3,7 +3,7 @@ import { ref, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { Command, type Child } from "@tauri-apps/plugin-shell";
 
-type Provider = "openai" | "ollama";
+type Provider = "openai" | "mlx";
 
 interface LogEntry {
   type: "step" | "ask_human" | "done" | "error" | "user_reply";
@@ -29,9 +29,14 @@ function addLog(entry: LogEntry) {
   });
 }
 
+const MLX_MODELS = [
+  { label: "Gemma 3 4B", id: "mlx-community/gemma-3-4b-it-4bit" },
+  { label: "Gemma 3 12B", id: "mlx-community/gemma-3-12b-it-4bit" },
+];
+
 function onModelPreset(p: Provider) {
   provider.value = p;
-  model.value = p === "openai" ? "gpt-4o-mini" : "gemma4:12b";
+  model.value = p === "openai" ? "gpt-4o-mini" : MLX_MODELS[0].id;
 }
 
 async function runAgent() {
@@ -126,10 +131,15 @@ function stopAgent() {
           @click="onModelPreset('openai')"
         >OpenAI</button>
         <button
-          :class="['preset', provider === 'ollama' ? 'active' : '']"
-          @click="onModelPreset('ollama')"
-        >Ollama</button>
-        <input v-model="model" class="model-input" placeholder="model name" />
+          :class="['preset', provider === 'mlx' ? 'active' : '']"
+          @click="onModelPreset('mlx')"
+        >MLX</button>
+        <template v-if="provider === 'mlx'">
+          <select v-model="model" class="model-input">
+            <option v-for="m in MLX_MODELS" :key="m.id" :value="m.id">{{ m.label }}</option>
+          </select>
+        </template>
+        <input v-else v-model="model" class="model-input" placeholder="model name" />
       </div>
     </section>
 
