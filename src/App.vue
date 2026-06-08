@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, nextTick } from "vue";
+import { ref, nextTick, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { Command, type Child } from "@tauri-apps/plugin-shell";
 
@@ -21,6 +21,10 @@ const logEl = ref<HTMLElement | null>(null);
 const hitlQuestion = ref("");
 const hitlAnswer = ref("");
 let activeChild: Child | null = null;
+
+watch(hitlQuestion, (q) => {
+  invoke("set_hitl_active", { active: !!q }).catch(() => {});
+});
 
 function addLog(entry: LogEntry) {
   log.value.push(entry);

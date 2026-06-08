@@ -25,6 +25,7 @@ fn remove_traffic_lights(window: &tauri::WebviewWindow<tauri::Cef>) {
 }
 
 struct TrayShown(Mutex<bool>);
+struct HitlActive(Mutex<bool>);
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
@@ -35,6 +36,11 @@ fn show_tray_window(app: tauri::AppHandle<tauri::Cef>) -> Result<(), String> {
         window.set_focus().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn set_hitl_active(app: tauri::AppHandle<tauri::Cef>, active: bool) {
+    *app.state::<HitlActive>().0.lock().unwrap() = active;
 }
 
 #[tauri::command]
@@ -143,6 +149,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .manage(TrayShown(Mutex::new(false)))
+        .manage(HitlActive(Mutex::new(false)))
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -176,9 +183,21 @@ pub fn run() {
             // (and its CDP target) stays alive for the agent.
             let app_for_close = app_handle.clone();
             tray_win.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    *app_for_close.state::<TrayShown>().0.lock().unwrap() = false;
+                match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        *app_for_close.state::<TrayShown>().0.lock().unwrap() = false;
+                    }
+                    tauri::WindowEvent::Focused(false) => {
+                        let hitl = *app_for_close.state::<HitlActive>().0.lock().unwrap();
+                        if !hitl {
+                            if let Some(win) = app_for_close.get_webview_window("tray_browser") {
+                                let _ = win.hide();
+                            }
+                            *app_for_close.state::<TrayShown>().0.lock().unwrap() = false;
+                        }
+                    }
+                    _ => {}
                 }
             });
             TrayIconBuilder::new()
@@ -242,6 +261,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             show_tray_window,
+            set_hitl_active,
             navigate_tray,
             eval_in_tray,
             cdp_eval,
