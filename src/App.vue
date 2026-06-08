@@ -12,7 +12,7 @@ interface LogEntry {
 
 const task = ref("");
 const provider = ref<Provider>("openai");
-const model = ref("gpt-4o-mini");
+const model = ref("gpt-5.4-mini");
 const running = ref(false);
 const log = ref<LogEntry[]>([]);
 const logEl = ref<HTMLElement | null>(null);
@@ -57,10 +57,21 @@ async function runAgent() {
       : {}),
   };
 
-  const cmd = Command.sidecar("binaries/python-sidecar", [JSON.stringify(request)]);
+  addLog({ type: "step", text: `Spawning sidecar (${provider.value}/${model.value})…` });
+  console.log("[minibro] spawn request:", request);
+
+  let cmd: ReturnType<typeof Command.sidecar>;
+  try {
+    cmd = Command.sidecar("binaries/python-sidecar", [JSON.stringify(request)]);
+  } catch (err) {
+    addLog({ type: "error", text: `Failed to create command: ${err}` });
+    running.value = false;
+    return;
+  }
 
   cmd.stdout.on("data", (line: string) => {
     line = line.trim();
+    console.log("[minibro] stdout:", line);
     if (!line) return;
     try {
       const data = JSON.parse(line);
@@ -70,7 +81,6 @@ async function runAgent() {
         hitlQuestion.value = data.ask_human;
         hitlAnswer.value = "";
         addLog({ type: "ask_human", text: data.ask_human });
-        // Show the tray browser so user can interact with the page
         invoke("show_tray_window").catch(() => {});
       } else if (data.done) {
         addLog({ type: "done", text: data.result ?? "Task completed" });
@@ -80,28 +90,46 @@ async function runAgent() {
         addLog({ type: "error", text: data.error });
         running.value = false;
         hitlQuestion.value = "";
+      } else {
+        addLog({ type: "step", text: `[raw] ${line}` });
       }
     } catch {
-      // ignore non-JSON lines
+      addLog({ type: "step", text: `[raw] ${line}` });
     }
   });
 
-  cmd.stderr.on("data", () => {});
+  cmd.stderr.on("data", (line: string) => {
+    line = line.trim();
+    if (!line) return;
+    console.warn("[minibro] stderr:", line);
+    addLog({ type: "error", text: `[stderr] ${line}` });
+  });
 
-  cmd.on("close", () => {
+  cmd.on("close", (data) => {
+    console.log("[minibro] process closed, code:", data?.code);
+    addLog({ type: "step", text: `Process exited (code ${data?.code ?? "?"})` });
     running.value = false;
     hitlQuestion.value = "";
     activeChild = null;
   });
 
   cmd.on("error", (err) => {
-    addLog({ type: "error", text: String(err) });
+    console.error("[minibro] process error:", err);
+    addLog({ type: "error", text: `Spawn error: ${err}` });
     running.value = false;
     hitlQuestion.value = "";
     activeChild = null;
   });
 
-  activeChild = await cmd.spawn();
+  try {
+    activeChild = await cmd.spawn();
+    console.log("[minibro] spawned pid:", activeChild.pid);
+    addLog({ type: "step", text: `Sidecar started (pid ${activeChild.pid})` });
+  } catch (err) {
+    console.error("[minibro] spawn failed:", err);
+    addLog({ type: "error", text: `Spawn failed: ${err}` });
+    running.value = false;
+  }
 }
 
 async function sendHitlAnswer() {

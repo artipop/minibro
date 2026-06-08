@@ -97,14 +97,26 @@ def make_llm(provider: str, model: str, api_key: str, port: int | None = None):
 
 # ── agent ─────────────────────────────────────────────────────────────────────
 
+async def find_tray_target_id(session) -> str | None:
+    """Return target_id of the tray browser (not tauri:// and not localhost:1420)."""
+    targets = session.session_manager.get_all_page_targets()
+    for t in targets:
+        url = t.url or ""
+        if not url.startswith("tauri://") and "localhost:1420" not in url:
+            return t.target_id
+    return None
+
+
 async def run_agent(task: str, api_key: str, provider: str, model: str) -> None:
     from browser_use import Agent, BrowserProfile, Controller
+    from browser_use.browser.session import BrowserSession
 
     if provider == "openai" and api_key:
         os.environ["OPENAI_API_KEY"] = api_key
 
     mlx_proc: asyncio.subprocess.Process | None = None
     mlx_port: int | None = None
+    browser_session: BrowserSession | None = None
 
     try:
         if provider == "mlx":
@@ -113,17 +125,22 @@ async def run_agent(task: str, api_key: str, provider: str, model: str) -> None:
         controller = Controller()
 
         @controller.action(
-            "Ask the human user to perform a manual action in the visible browser window "
-            "(e.g. log in, solve CAPTCHA, accept a dialog). "
-            "Use this whenever you cannot proceed without user intervention."
+            "Ask the human user to do something that requires manual interaction: "
+            "log in, solve a CAPTCHA, confirm a dialog, handle 2FA, or any step "
+            "you cannot complete yourself. IMPORTANT: call this action as soon as "
+            "you encounter a login wall, CAPTCHA, or any page you cannot interact "
+            "with. Do NOT retry the same failing action more than twice — ask the "
+            "human instead. The human will act in the visible browser window and "
+            "reply when done."
         )
         async def ask_human(question: str) -> str:
             emit({"ask_human": question})
-            if sys.stdin is None:
-                return "stdin not available"
-            loop = asyncio.get_event_loop()
-            answer = await loop.run_in_executor(None, sys.stdin.readline)
-            return answer.strip() or "done"
+            try:
+                loop = asyncio.get_running_loop()
+                answer = await loop.run_in_executor(None, sys.stdin.readline)
+                return answer.strip() or "done"
+            except Exception as exc:
+                return f"(stdin error: {exc})"
 
         def on_step(browser_state, agent_output, step_num: int) -> None:
             goal = getattr(agent_output, "next_goal", None) or f"step {step_num}"
@@ -132,14 +149,33 @@ async def run_agent(task: str, api_key: str, provider: str, model: str) -> None:
         profile = BrowserProfile(cdp_url="http://localhost:9229")
         llm = make_llm(provider, model, api_key, mlx_port)
 
+        # Start session manually so we can lock focus to the tray browser target
+        # before the agent sees multiple tabs and picks the wrong one.
+        browser_session = BrowserSession(browser_profile=profile)
+        await browser_session.start()
+
+        tray_id = await find_tray_target_id(browser_session)
+        if tray_id:
+            browser_session.agent_focus_target_id = tray_id
+            emit({"step": f"Locked to tray browser target {tray_id[:8]}…"})
+        else:
+            emit({"step": "Warning: could not identify tray browser target, using first available"})
+
         agent = Agent(
             task=task,
             llm=llm,
-            browser_profile=profile,
+            browser_session=browser_session,
             controller=controller,
             register_new_step_callback=on_step,
             generate_gif=False,
             use_judge=False,
+            max_failures=3,
+            extend_system_message=(
+                "When you cannot proceed — login required, CAPTCHA, 2FA, "
+                "permission denied, or any blocker — STOP retrying and call "
+                "ask_human() immediately. Do not attempt the same failing "
+                "action more than twice."
+            ),
         )
 
         emit({"step": f"Agent running ({provider}/{model})"})
@@ -151,6 +187,11 @@ async def run_agent(task: str, api_key: str, provider: str, model: str) -> None:
     except Exception as exc:
         emit({"error": str(exc)})
     finally:
+        if browser_session is not None:
+            try:
+                await browser_session.stop()
+            except Exception:
+                pass
         if mlx_proc is not None:
             try:
                 mlx_proc.terminate()

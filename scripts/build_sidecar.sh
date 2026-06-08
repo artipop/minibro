@@ -16,6 +16,9 @@ uv run pyinstaller \
     --distpath "$BINARIES_DIR" \
     --workpath "$PYTHON_DIR/build" \
     --specpath "$PYTHON_DIR" \
+    --collect-all browser_use \
+    --exclude-module oci \
+    --exclude-module browser_use.llm.oci_raw \
     main.py
 
 ARCH=$(uname -m)
