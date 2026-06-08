@@ -29,6 +29,15 @@ struct TrayShown(Mutex<bool>);
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
+fn show_tray_window(app: tauri::AppHandle<tauri::Cef>) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("tray_browser") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn navigate_tray(app: tauri::AppHandle<tauri::Cef>, url: String) -> Result<(), String> {
     let window = app
         .get_webview_window("tray_browser")
@@ -132,6 +141,7 @@ pub fn run() {
     tauri::Builder::<tauri::Cef>::new()
         .command_line_args([("remote-debugging-port", Some("9229"))])
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
         .manage(TrayShown(Mutex::new(false)))
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -231,6 +241,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            show_tray_window,
             navigate_tray,
             eval_in_tray,
             cdp_eval,
