@@ -44,10 +44,23 @@ fn set_hitl_active(app: tauri::AppHandle<tauri::Cef>, active: bool) {
     *app.state::<HitlActive>().0.lock().unwrap() = active;
 }
 
-// Raw RGBA (32×32) dot-badge variants generated from 32x32.png via PIL.
-const ICON_RUNNING: &[u8] = include_bytes!("../icons/tray-running.rgba");
-const ICON_ALERT:   &[u8] = include_bytes!("../icons/tray-alert.rgba");
-const ICON_DONE:    &[u8] = include_bytes!("../icons/tray-done.rgba");
+const BASE_ICON_PNG: &[u8] = include_bytes!("../icons/32x32.png");
+
+fn icon_with_dot(r: u8, g: u8, b: u8) -> tauri::image::Image<'static> {
+    let mut img = image::load_from_memory(BASE_ICON_PNG)
+        .expect("base icon")
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    let (cx, cy, radius) = (w as i32 - 6, h as i32 - 6, 6i32);
+    for py in 0..h as i32 {
+        for px in 0..w as i32 {
+            if (px - cx).pow(2) + (py - cy).pow(2) <= radius.pow(2) {
+                img.put_pixel(px as u32, py as u32, image::Rgba([r, g, b, 255]));
+            }
+        }
+    }
+    tauri::image::Image::new_owned(img.into_raw(), w, h)
+}
 
 /// status: "idle" | "running" | "alert" | "done"
 #[tauri::command]
@@ -56,10 +69,10 @@ fn set_tray_status(app: tauri::AppHandle<tauri::Cef>, status: String) -> Result<
     let guard = state.0.lock().unwrap();
     let Some(tray) = guard.as_ref() else { return Ok(()) };
     let icon = match status.as_str() {
-        "running" => tauri::image::Image::new(ICON_RUNNING, 32, 32),
-        "alert"   => tauri::image::Image::new(ICON_ALERT,   32, 32),
-        "done"    => tauri::image::Image::new(ICON_DONE,    32, 32),
-        _         => app.default_window_icon().cloned().ok_or("no default icon")?,
+        "running" => icon_with_dot(150, 150, 150),
+        "alert"   => icon_with_dot(255, 160,   0),
+        "done"    => icon_with_dot( 46, 204, 113),
+        _         => return tray.set_icon(app.default_window_icon().cloned()).map_err(|e| e.to_string()),
     };
     tray.set_icon(Some(icon)).map_err(|e| e.to_string())
 }
@@ -183,7 +196,8 @@ pub fn run() {
             )
             .decorations(false)
             .always_on_top(true)
-            .inner_size(800.0, 600.0)
+            .inner_size(640.0, 420.0)
+            .resizable(false)
             .visible(false)
             .build()?;
 
@@ -253,7 +267,7 @@ pub fn run() {
                             tauri::Size::Logical(s) => s.height,
                         };
 
-                        let x = (icon_x + icon_w / 2.0 - 400.0) as i32;
+                        let x = (icon_x + icon_w / 2.0 - 320.0) as i32;
                         let y = (icon_y + icon_h) as i32;
 
                         let shown = app_handle.state::<TrayShown>();
