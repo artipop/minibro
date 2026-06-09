@@ -6,8 +6,10 @@ import { Command, type Child } from "@tauri-apps/plugin-shell";
 type Provider = "openai" | "mlx";
 
 interface LogEntry {
-  type: "step" | "ask_human" | "done" | "error" | "user_reply";
+  type: "step" | "step_debug" | "step_pending" | "step_success" | "step_error" | "ask_human" | "done" | "error" | "log_error" | "user_reply";
   text: string;
+  stepId?: number;
+  errorText?: string;
 }
 
 const task = ref("");
@@ -86,8 +88,18 @@ async function runAgent() {
     if (!line) return;
     try {
       const data = JSON.parse(line);
-      if (data.step) {
-        addLog({ type: "step", text: data.step });
+      if (data.step_start !== undefined) {
+        addLog({ type: "step_pending", text: data.step_start, stepId: data.step_id });
+      } else if (data.step_done) {
+        const { id, success, error } = data.step_done;
+        const entry = log.value.find(e => e.stepId === id);
+        if (entry) {
+          entry.type = success ? "step_success" : "step_error";
+          if (error) entry.errorText = error;
+        }
+      } else if (data.step) {
+        const isDebug = (data.step as string).startsWith("[debug]") || (data.step as string).startsWith("[HITL]");
+        addLog({ type: isDebug ? "step_debug" : "step", text: data.step });
       } else if (data.ask_human) {
         hitlQuestion.value = data.ask_human;
         hitlAnswer.value = "";
@@ -102,6 +114,8 @@ async function runAgent() {
         addLog({ type: "error", text: data.error });
         running.value = false;
         hitlQuestion.value = "";
+      } else if (data.log_error) {
+        addLog({ type: "log_error", text: data.log_error });
       } else {
         addLog({ type: "step", text: `[raw] ${line}` });
       }
@@ -111,10 +125,7 @@ async function runAgent() {
   });
 
   cmd.stderr.on("data", (line: string) => {
-    line = line.trim();
-    if (!line) return;
-    console.warn("[minibro] stderr:", line);
-    addLog({ type: "error", text: `[stderr] ${line}` });
+    console.warn("[minibro] stderr:", line.trim());
   });
 
   cmd.on("close", (data) => {
@@ -152,12 +163,21 @@ async function sendHitlAnswer() {
   await activeChild.write(answer + "\n");
   hitlQuestion.value = "";
   hitlAnswer.value = "";
+  setTrayStatus("running");
 }
 
 function stopAgent() {
   activeChild?.kill().catch(() => {});
   running.value = false;
   hitlQuestion.value = "";
+}
+
+function badgeLabel(entry: LogEntry): string {
+  if (entry.type === "step_pending") return "step";
+  if (entry.type === "step_debug") return "dbg";
+  if (entry.type === "step_success") return "ok";
+  if (entry.type === "step_error") return "fail";
+  return entry.type;
 }
 </script>
 
@@ -220,8 +240,11 @@ function stopAgent() {
     <section v-if="log.length" class="log-section">
       <div ref="logEl" class="log">
         <div v-for="(entry, i) in log" :key="i" :class="['log-entry', entry.type]">
-          <span class="badge">{{ entry.type }}</span>
-          <span class="text">{{ entry.text }}</span>
+          <span class="badge">{{ badgeLabel(entry) }}</span>
+          <span class="entry-body">
+            <span class="text">{{ entry.text }}</span>
+            <span v-if="entry.errorText" class="error-detail">{{ entry.errorText }}</span>
+          </span>
         </div>
       </div>
     </section>
@@ -380,6 +403,19 @@ h1 {
   align-items: flex-start;
 }
 
+.entry-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.error-detail {
+  font-size: 0.78rem;
+  color: #e74c3c;
+  word-break: break-word;
+}
+
 .badge {
   flex-shrink: 0;
   font-size: 0.7rem;
@@ -390,11 +426,17 @@ h1 {
   margin-top: 1px;
 }
 
-.log-entry.step .badge        { background: #2c3e50; color: #95a5a6; }
-.log-entry.ask_human .badge   { background: #7d6608; color: #f1c40f; }
-.log-entry.done .badge        { background: #1a5c2a; color: #2ecc71; }
-.log-entry.error .badge       { background: #5c1a1a; color: #e74c3c; }
-.log-entry.user_reply .badge  { background: #1a3a5c; color: #3498db; }
+.log-entry.step .badge         { background: #2c3e50; color: #95a5a6; }
+.log-entry.step_debug .badge   { background: #1a1a2e; color: #4a4a6a; }
+.log-entry.step_debug .text    { color: #555; font-size: 0.8rem; }
+.log-entry.step_pending .badge { background: #2c3e50; color: #7f8c8d; }
+.log-entry.step_success .badge { background: #1a4a2a; color: #2ecc71; }
+.log-entry.step_error .badge   { background: #4a1a1a; color: #e74c3c; }
+.log-entry.ask_human .badge    { background: #7d6608; color: #f1c40f; }
+.log-entry.done .badge         { background: #1a5c2a; color: #2ecc71; }
+.log-entry.error .badge        { background: #5c1a1a; color: #e74c3c; }
+.log-entry.log_error .badge    { background: #5c3a00; color: #e67e22; }
+.log-entry.user_reply .badge   { background: #1a3a5c; color: #3498db; }
 
 .text {
   color: #ccc;

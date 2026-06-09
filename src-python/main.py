@@ -26,7 +26,23 @@ import sys
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "false")
 os.environ.setdefault("BROWSER_USE_SETUP_LOGGING", "false")
-logging.disable(logging.WARNING)
+os.environ.setdefault("TIMEOUT_ScreenshotEvent", "60")
+
+
+class _StdoutErrorHandler(logging.Handler):
+    """Route ERROR+ log records to stdout as structured events; drop the rest."""
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno >= logging.ERROR:
+            try:
+                emit({"log_error": self.format(record)})
+            except Exception:
+                pass
+
+
+logging.disable(logging.WARNING)          # drop DEBUG / INFO / WARNING
+_handler = _StdoutErrorHandler()
+_handler.setLevel(logging.ERROR)
+logging.root.addHandler(_handler)         # still catches ERROR / CRITICAL
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -117,6 +133,8 @@ async def run_agent(task: str, api_key: str, provider: str, model: str) -> None:
     mlx_proc: asyncio.subprocess.Process | None = None
     mlx_port: int | None = None
     browser_session: BrowserSession | None = None
+    agent_ref: list = [None]
+    last_step_reported = [0]
 
     try:
         if provider == "mlx":
@@ -126,27 +144,103 @@ async def run_agent(task: str, api_key: str, provider: str, model: str) -> None:
 
         @controller.action(
             "Ask the human user to do something that requires manual interaction: "
-            "log in, solve a CAPTCHA, confirm a dialog, handle 2FA, or any step "
-            "you cannot complete yourself. IMPORTANT: call this action as soon as "
-            "you encounter a login wall, CAPTCHA, or any page you cannot interact "
-            "with. Do NOT retry the same failing action more than twice — ask the "
-            "human instead. The human will act in the visible browser window and "
-            "reply when done."
+            "log in, solve a CAPTCHA, confirm a dialog, handle 2FA, dismiss a "
+            "large cookie/GDPR consent banner that covers significant page area "
+            "and blocks you from clicking elements, or any other step you cannot "
+            "complete yourself. IMPORTANT: call this action as soon as you "
+            "encounter any of these blockers. Do NOT retry the same failing "
+            "action more than twice — ask the human instead. The human will act "
+            "in the visible browser window and reply when done."
         )
         async def ask_human(question: str) -> str:
             emit({"ask_human": question})
+            emit({"step": f"[HITL] Waiting for human: {question[:100]}"})
             try:
                 loop = asyncio.get_running_loop()
-                answer = await loop.run_in_executor(None, sys.stdin.readline)
-                return answer.strip() or "done"
+                raw = await loop.run_in_executor(None, sys.stdin.readline)
+                stripped = raw.strip()
+                emit({"step": f"[HITL] Received raw stdin: {repr(raw[:120])}"})
+                if not stripped:
+                    stripped = "done"
+                emit({"step": f"[HITL] Returning to agent: {stripped[:100]}"})
+                # Wrap the answer so the LLM clearly understands the human acted and why.
+                return (
+                    f"The human has completed the requested action in the browser. "
+                    f"Human's message: \"{stripped}\". "
+                    f"The page state may have changed — take a screenshot and continue the task."
+                )
             except Exception as exc:
+                emit({"step": f"[HITL] stdin error: {exc}"})
                 return f"(stdin error: {exc})"
 
         def on_step(browser_state, agent_output, step_num: int) -> None:
             goal = getattr(agent_output, "next_goal", None) or f"step {step_num}"
-            emit({"step": goal})
 
-        profile = BrowserProfile(cdp_url="http://localhost:9229")
+            # When step N starts, step N-1 just completed — report its result.
+            prev = step_num - 1
+            if prev > 0 and prev > last_step_reported[0] and agent_ref[0] is not None:
+                try:
+                    h = agent_ref[0].history.history
+                    idx = prev - 1
+                    if 0 <= idx < len(h):
+                        results = getattr(h[idx], "result", None) or []
+                        errors = [r.error for r in results if getattr(r, "error", None)]
+                        # Log the raw action results for debugging HITL re-ask issues.
+                        for r in results:
+                            extracted = getattr(r, "extracted_content", None)
+                            if extracted:
+                                emit({"step": f"[debug] step {prev} result: {str(extracted)[:200]}"})
+                        emit({"step_done": {
+                            "id": prev,
+                            "success": not errors,
+                            "error": errors[0] if errors else None,
+                        }})
+                        last_step_reported[0] = prev
+                except Exception as exc:
+                    emit({"step": f"[debug] step_done extraction error: {exc}"})
+
+            # Log current URL and model evaluation for post-HITL debugging.
+            try:
+                url = getattr(browser_state, "url", None) or ""
+                if url:
+                    emit({"step": f"[debug] url: {url[:120]}"})
+            except Exception:
+                pass
+            try:
+                evaluation = getattr(
+                    getattr(agent_output, "current_state", None),
+                    "evaluation_previous_goal", None
+                )
+                if evaluation:
+                    emit({"step": f"[debug] eval: {str(evaluation)[:200]}"})
+            except Exception:
+                pass
+
+            emit({"step_start": goal, "step_id": step_num})
+
+        # Verify CDP is up before handing to browser-use; if we pass a bad URL,
+        # browser-use falls back to launching its own Chromium (dock bounce on macOS).
+        import httpx
+        cdp_url = "http://localhost:9229"
+        for attempt in range(10):
+            try:
+                async with httpx.AsyncClient() as c:
+                    r = await c.get(f"{cdp_url}/json/version", timeout=2.0)
+                    if r.status_code == 200:
+                        break
+            except Exception:
+                pass
+            if attempt == 9:
+                emit({"error": "Tray browser CDP not reachable on port 9229"})
+                return
+            await asyncio.sleep(0.5)
+            emit({"step": f"Waiting for tray browser… ({attempt + 1}/10)"})
+
+        profile = BrowserProfile(
+            cdp_url=cdp_url,
+            minimum_wait_page_load_time=0.1,
+            wait_between_actions=0.1,
+        )
         llm = make_llm(provider, model, api_key, mlx_port)
 
         # Start session manually so we can lock focus to the tray browser target
@@ -169,17 +263,42 @@ async def run_agent(task: str, api_key: str, provider: str, model: str) -> None:
             register_new_step_callback=on_step,
             generate_gif=False,
             use_judge=False,
+            flash_mode=True,
             max_failures=3,
             extend_system_message=(
                 "When you cannot proceed — login required, CAPTCHA, 2FA, "
                 "permission denied, or any blocker — STOP retrying and call "
                 "ask_human() immediately. Do not attempt the same failing "
-                "action more than twice."
+                "action more than twice. "
+                "If a cookie consent or GDPR banner covers a large portion of "
+                "the page and prevents you from interacting with elements behind "
+                "it, call ask_human() to let the human dismiss it. "
+                "Always respond in the same language the user used in their task. "
+                "Be extremely concise and direct. "
+                "Use multi-action sequences whenever possible to reduce steps."
             ),
         )
+        agent_ref[0] = agent
 
         emit({"step": f"Agent running ({provider}/{model})"})
         history = await agent.run(max_steps=50)
+
+        # Report result of the final step (no subsequent step fires for it).
+        try:
+            h = history.history
+            if h:
+                final_step = len(h)
+                if final_step > last_step_reported[0]:
+                    idx = final_step - 1
+                    results = getattr(h[idx], "result", None) or []
+                    errors = [r.error for r in results if getattr(r, "error", None)]
+                    emit({"step_done": {
+                        "id": final_step,
+                        "success": not errors,
+                        "error": errors[0] if errors else None,
+                    }})
+        except Exception:
+            pass
 
         result = getattr(history, "final_result", lambda: None)()
         emit({"done": True, "result": result or "Task completed"})
