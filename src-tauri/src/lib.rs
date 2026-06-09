@@ -26,6 +26,7 @@ fn remove_traffic_lights(window: &tauri::WebviewWindow<tauri::Cef>) {
 
 struct TrayShown(Mutex<bool>);
 struct HitlActive(Mutex<bool>);
+struct TrayHandle(Mutex<Option<tauri::tray::TrayIcon<tauri::Cef>>>);
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
@@ -41,6 +42,26 @@ fn show_tray_window(app: tauri::AppHandle<tauri::Cef>) -> Result<(), String> {
 #[tauri::command]
 fn set_hitl_active(app: tauri::AppHandle<tauri::Cef>, active: bool) {
     *app.state::<HitlActive>().0.lock().unwrap() = active;
+}
+
+// Raw RGBA (32×32) dot-badge variants generated from 32x32.png via PIL.
+const ICON_RUNNING: &[u8] = include_bytes!("../icons/tray-running.rgba");
+const ICON_ALERT:   &[u8] = include_bytes!("../icons/tray-alert.rgba");
+const ICON_DONE:    &[u8] = include_bytes!("../icons/tray-done.rgba");
+
+/// status: "idle" | "running" | "alert" | "done"
+#[tauri::command]
+fn set_tray_status(app: tauri::AppHandle<tauri::Cef>, status: String) -> Result<(), String> {
+    let state = app.state::<TrayHandle>();
+    let guard = state.0.lock().unwrap();
+    let Some(tray) = guard.as_ref() else { return Ok(()) };
+    let icon = match status.as_str() {
+        "running" => tauri::image::Image::new(ICON_RUNNING, 32, 32),
+        "alert"   => tauri::image::Image::new(ICON_ALERT,   32, 32),
+        "done"    => tauri::image::Image::new(ICON_DONE,    32, 32),
+        _         => app.default_window_icon().cloned().ok_or("no default icon")?,
+    };
+    tray.set_icon(Some(icon)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -150,6 +171,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(TrayShown(Mutex::new(false)))
         .manage(HitlActive(Mutex::new(false)))
+        .manage(TrayHandle(Mutex::new(None)))
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -200,7 +222,7 @@ pub fn run() {
                     _ => {}
                 }
             });
-            TrayIconBuilder::new()
+            TrayIconBuilder::with_id("main")
                 .icon(app.default_window_icon().unwrap().clone())
                 .on_tray_icon_event(move |_tray, event| {
                     if let TrayIconEvent::Click {
@@ -255,13 +277,17 @@ pub fn run() {
                         }
                     }
                 })
-                .build(app)?;
+                .build(app)
+                .map(|tray| {
+                    *app.state::<TrayHandle>().0.lock().unwrap() = Some(tray);
+                })?;
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             show_tray_window,
             set_hitl_active,
+            set_tray_status,
             navigate_tray,
             eval_in_tray,
             cdp_eval,

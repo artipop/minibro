@@ -22,8 +22,14 @@ const hitlQuestion = ref("");
 const hitlAnswer = ref("");
 let activeChild: Child | null = null;
 
+function setTrayStatus(status: "idle" | "running" | "alert" | "done") {
+  invoke("set_tray_status", { status }).catch(() => {});
+}
+
 watch(hitlQuestion, (q) => {
-  invoke("set_hitl_active", { active: !!q }).catch(() => {});
+  const active = !!q;
+  invoke("set_hitl_active", { active }).catch(() => {});
+  setTrayStatus(active ? "alert" : running.value ? "running" : "idle");
 });
 
 function addLog(entry: LogEntry) {
@@ -61,6 +67,7 @@ async function runAgent() {
       : {}),
   };
 
+  setTrayStatus("running");
   addLog({ type: "step", text: `Spawning sidecar (${provider.value}/${model.value})…` });
   console.log("[minibro] spawn request:", request);
 
@@ -90,6 +97,7 @@ async function runAgent() {
         addLog({ type: "done", text: data.result ?? "Task completed" });
         running.value = false;
         hitlQuestion.value = "";
+        setTrayStatus("done");
       } else if (data.error) {
         addLog({ type: "error", text: data.error });
         running.value = false;
@@ -115,6 +123,7 @@ async function runAgent() {
     running.value = false;
     hitlQuestion.value = "";
     activeChild = null;
+    setTrayStatus("idle");
   });
 
   cmd.on("error", (err) => {
