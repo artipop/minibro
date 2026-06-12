@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 const greetMsg = ref("");
 const name = ref("");
@@ -8,6 +9,50 @@ const name = ref("");
 async function greet() {
   // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
   greetMsg.value = await invoke("greet", { name: name.value });
+}
+
+const axTrusted = ref<boolean | null>(null);
+const notificationsDump = ref("");
+
+async function checkAx() {
+  axTrusted.value = await invoke("ax_check_permission", { prompt: true });
+}
+
+async function readNotifications() {
+  try {
+    const items = await invoke("get_notifications");
+    notificationsDump.value = JSON.stringify(items, null, 2);
+  } catch (e) {
+    notificationsDump.value = String(e);
+  }
+}
+
+interface LoggedNotification {
+  seen_at_ms: number;
+  description: string | null;
+  texts: string[];
+}
+
+const watcherRunning = ref(false);
+const watcherError = ref("");
+const log = ref<LoggedNotification[]>([]);
+
+async function startWatcher() {
+  if (watcherRunning.value) return;
+  try {
+    await invoke("start_notification_watcher");
+    watcherRunning.value = true;
+    await listen<LoggedNotification>("notifications://new", (e) => {
+      log.value.push(e.payload);
+    });
+    log.value = await invoke("get_notification_log");
+  } catch (e) {
+    watcherError.value = String(e);
+  }
+}
+
+function formatTime(ms: number) {
+  return new Date(ms).toLocaleTimeString();
 }
 </script>
 
@@ -33,6 +78,30 @@ async function greet() {
       <button type="submit">Greet</button>
     </form>
     <p>{{ greetMsg }}</p>
+
+    <h2>Уведомления macOS (Accessibility)</h2>
+    <div class="row">
+      <button @click="checkAx">Проверить доступ</button>
+      <button @click="readNotifications">Прочитать уведомления</button>
+    </div>
+    <p v-if="axTrusted !== null">
+      Accessibility: {{ axTrusted ? "разрешено" : "нет доступа" }}
+    </p>
+    <pre v-if="notificationsDump" class="notifications-dump">{{ notificationsDump }}</pre>
+
+    <h2>Наблюдатель (фоновый лог)</h2>
+    <div class="row">
+      <button @click="startWatcher" :disabled="watcherRunning">
+        {{ watcherRunning ? "Наблюдатель работает" : "Запустить наблюдатель" }}
+      </button>
+    </div>
+    <p v-if="watcherError">{{ watcherError }}</p>
+    <ul v-if="log.length" class="notification-log">
+      <li v-for="(n, i) in log" :key="i">
+        <span class="log-time">{{ formatTime(n.seen_at_ms) }}</span>
+        {{ n.description ?? n.texts.join(" — ") }}
+      </li>
+    </ul>
   </main>
 </template>
 
@@ -86,6 +155,31 @@ async function greet() {
 .row {
   display: flex;
   justify-content: center;
+  gap: 5px;
+}
+
+.notification-log {
+  text-align: left;
+  max-width: 80%;
+  margin: 1em auto;
+  padding-left: 1.5em;
+}
+
+.log-time {
+  opacity: 0.6;
+  margin-right: 0.5em;
+  font-variant-numeric: tabular-nums;
+}
+
+.notifications-dump {
+  text-align: left;
+  max-width: 80%;
+  margin: 1em auto;
+  padding: 1em;
+  border-radius: 8px;
+  background-color: rgba(128, 128, 128, 0.15);
+  overflow: auto;
+  white-space: pre-wrap;
 }
 
 a {
