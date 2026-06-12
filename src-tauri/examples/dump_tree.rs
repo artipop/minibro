@@ -1,7 +1,9 @@
-//! Отладочный дамп AX-дерева NotificationCenter: `cargo run --example dump_tree`.
+//! Отладочный дамп AX-дерева процесса: `cargo run --example dump_tree [процесс]`
+//! (по умолчанию NotificationCenter).
 
 fn main() {
-    match minibro_lib::notifications::dump_tree() {
+    let process = std::env::args().nth(1).unwrap_or("NotificationCenter".into());
+    match minibro_lib::notifications::dump_tree_for(&process) {
         Ok(tree) => println!("{tree}"),
         Err(e) => {
             eprintln!("error: {e}");

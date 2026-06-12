@@ -48,6 +48,7 @@ extern "C" {
         value: *mut CFTypeRef,
     ) -> AXError;
     fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
+    fn AXUIElementCopyAttributeNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
     fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
 
     fn AXObserverCreate(
@@ -101,9 +102,9 @@ pub fn ax_trusted(prompt: bool) -> bool {
     }
 }
 
-fn notification_center_pid() -> Option<i32> {
+fn pid_of(process: &str) -> Option<i32> {
     let output = Command::new("/usr/bin/pgrep")
-        .args(["-x", "NotificationCenter"])
+        .args(["-x", process])
         .output()
         .ok()?;
     String::from_utf8_lossy(&output.stdout)
@@ -112,6 +113,10 @@ fn notification_center_pid() -> Option<i32> {
         .trim()
         .parse()
         .ok()
+}
+
+fn notification_center_pid() -> Option<i32> {
+    pid_of("NotificationCenter")
 }
 
 fn copy_attr(element: AXUIElementRef, name: &str) -> Option<CFType> {
@@ -280,8 +285,7 @@ fn expand_stacks_pass() -> Result<usize, String> {
         *budget -= 1;
         if let Some(subrole) = attr_string(element, "AXSubrole") {
             if subrole.starts_with("AXNotificationCenter") && subrole.ends_with("Stack") {
-                let action = CFString::new("AXPress");
-                unsafe { AXUIElementPerformAction(element, action.as_concrete_TypeRef()) };
+                press_element(element);
                 *pressed += 1;
                 return;
             }
@@ -319,6 +323,97 @@ pub fn read_notifications() -> Result<Vec<NotificationItem>, String> {
     read_notifications_opts(false)
 }
 
+fn press_element(element: AXUIElementRef) -> AXError {
+    let action = CFString::new("AXPress");
+    unsafe { AXUIElementPerformAction(element, action.as_concrete_TypeRef()) }
+}
+
+/// Жмёт часы в меню-баре (toggle шторки): AXMenuBarItem с идентификатором
+/// com.apple.menuextra.clock. На macOS 26 экстры меню-бара живут в процессе
+/// MenuBarAgent, на более старых — в ControlCenter; пробуем оба.
+fn press_menu_bar_clock() -> Result<(), String> {
+    fn find_and_press(element: AXUIElementRef, depth: usize, budget: &mut usize, pressed: &mut bool) {
+        if *pressed || depth > 10 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if attr_string(element, "AXIdentifier").as_deref() == Some("com.apple.menuextra.clock") {
+            press_element(element);
+            *pressed = true;
+            return;
+        }
+        for_each_child(element, |child| find_and_press(child, depth + 1, budget, pressed));
+    }
+
+    for process in ["MenuBarAgent", "ControlCenter"] {
+        let Some(pid) = pid_of(process) else {
+            continue;
+        };
+        let app = unsafe { AXUIElementCreateApplication(pid) };
+        if app.is_null() {
+            continue;
+        }
+        let app = unsafe { CFType::wrap_under_create_rule(app as CFTypeRef) };
+        let mut pressed = false;
+        let mut budget = 5_000usize;
+        find_and_press(app.as_CFTypeRef() as AXUIElementRef, 0, &mut budget, &mut pressed);
+        if pressed {
+            return Ok(());
+        }
+    }
+    Err("Часы (com.apple.menuextra.clock) не найдены в меню-баре".into())
+}
+
+/// Открыта ли шторка (а не просто висит баннер): ищем контейнер списка
+/// уведомлений AXNotificationListItems.
+fn shade_is_open() -> bool {
+    fn has_list(element: AXUIElementRef, depth: usize, budget: &mut usize, found: &mut bool) {
+        if *found || depth > 20 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if attr_string(element, "AXIdentifier").as_deref() == Some("AXNotificationListItems") {
+            *found = true;
+            return;
+        }
+        for_each_child(element, |child| has_list(child, depth + 1, budget, found));
+    }
+    let mut found = false;
+    let mut budget = 5_000usize;
+    let _ = for_each_window(|window| has_list(window, 0, &mut budget, &mut found));
+    found
+}
+
+/// Открывает шторку кликом по часам и ждёт её появления.
+pub fn open_shade() -> Result<(), String> {
+    if shade_is_open() {
+        return Ok(());
+    }
+    press_menu_bar_clock()?;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(150));
+        if shade_is_open() {
+            return Ok(());
+        }
+    }
+    Err("Шторка не открылась после клика по часам".into())
+}
+
+/// Закрывает шторку повторным кликом по часам.
+pub fn close_shade() -> Result<(), String> {
+    if !shade_is_open() {
+        return Ok(());
+    }
+    press_menu_bar_clock()?;
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(150));
+        if !shade_is_open() {
+            return Ok(());
+        }
+    }
+    Err("Шторка не закрылась после клика по часам".into())
+}
+
 /// Ищет среди видимых уведомлений (не стопок) элемент с данным AXIdentifier
 /// и нажимает его. Возвращает true, если нашёл и нажал.
 fn try_press_by_id(target: &str) -> Result<bool, String> {
@@ -339,8 +434,7 @@ fn try_press_by_id(target: &str) -> Result<bool, String> {
                 "AXNotificationCenterAlert" | "AXNotificationCenterBanner"
             ) && attr_string(element, "AXIdentifier").as_deref() == Some(target)
             {
-                let action = CFString::new("AXPress");
-                unsafe { AXUIElementPerformAction(element, action.as_concrete_TypeRef()) };
+                press_element(element);
                 *pressed = true;
                 return;
             }
@@ -355,21 +449,37 @@ fn try_press_by_id(target: &str) -> Result<bool, String> {
 }
 
 /// Находит уведомление по AXIdentifier и кликает по нему (открывает в его
-/// приложении). Если уведомление спрятано в свёрнутой стопке, раскрывает
-/// стопки, пока не найдёт. Работает по видимому: баннер или открытая шторка.
+/// приложении). Если уведомление спрятано в свёрнутой стопке — раскрывает
+/// стопки; если не видно вовсе — сам открывает шторку, а после неудачи
+/// закрывает её обратно.
 pub fn press_notification(target: &str) -> Result<(), String> {
+    let mut opened_by_us = false;
+    let result = press_notification_inner(target, &mut opened_by_us);
+    // После успешного клика шторка закрывается сама; если мы её открывали,
+    // а она осталась (неудача или клик не закрыл) — возвращаем как было.
+    if opened_by_us && shade_is_open() {
+        let _ = close_shade();
+    }
+    result
+}
+
+fn press_notification_inner(target: &str, opened_by_us: &mut bool) -> Result<(), String> {
     // У свёрнутой стопки AXIdentifier совпадает с верхним уведомлением, поэтому
     // прямой клик по стопке не делаем: раскрываем и жмём уже одиночный элемент.
-    for _ in 0..6 {
+    for _ in 0..10 {
         if try_press_by_id(target)? {
             return Ok(());
         }
-        if expand_stacks_pass()? == 0 {
-            return Err(format!(
-                "Уведомление {target} не найдено. Видны только баннеры и открытая шторка — проверь, что шторка открыта."
-            ));
+        if expand_stacks_pass()? > 0 {
+            std::thread::sleep(Duration::from_millis(500)); // анимация раскрытия
+            continue;
         }
-        std::thread::sleep(Duration::from_millis(500)); // анимация раскрытия
+        if !*opened_by_us && !shade_is_open() {
+            open_shade()?;
+            *opened_by_us = true;
+            continue;
+        }
+        return Err(format!("Уведомление {target} не найдено в Notification Center"));
     }
     Err(format!("Уведомление {target} не найдено после раскрытия стопок"))
 }
@@ -537,9 +647,9 @@ pub fn notification_log() -> Vec<LoggedNotification> {
     LOG.lock().unwrap().items.clone()
 }
 
-/// Отладочный дамп AX-дерева NotificationCenter: роль/subrole/описание/значение
-/// с отступами по глубине.
-pub fn dump_tree() -> Result<String, String> {
+/// Отладочный дамп AX-дерева процесса (по имени для pgrep):
+/// роль/subrole/описание/значение с отступами по глубине.
+pub fn dump_tree_for(process: &str) -> Result<String, String> {
     fn dump(element: AXUIElementRef, depth: usize, budget: &mut usize, out: &mut String) {
         if depth > 40 || *budget == 0 {
             return;
@@ -557,16 +667,41 @@ pub fn dump_tree() -> Result<String, String> {
         for_each_child(element, |child| dump(child, depth + 1, budget, out));
     }
 
-    let pid = notification_center_pid().ok_or("NotificationCenter не найден")?;
+    let pid = pid_of(process).ok_or_else(|| format!("Процесс {process} не найден"))?;
     let app = unsafe { AXUIElementCreateApplication(pid) };
     if app.is_null() {
         return Err("AXUIElementCreateApplication вернул null".into());
     }
     let app = unsafe { CFType::wrap_under_create_rule(app as CFTypeRef) };
     let mut out = String::new();
+
+    // Имена атрибутов корневого элемента — видно, где спрятаны дети.
+    let mut names: CFArrayRef = std::ptr::null();
+    let err = unsafe {
+        AXUIElementCopyAttributeNames(app.as_CFTypeRef() as AXUIElementRef, &mut names)
+    };
+    if err == K_AX_ERROR_SUCCESS && !names.is_null() {
+        let owned = unsafe { CFType::wrap_under_create_rule(names as CFTypeRef) };
+        let array = owned.as_CFTypeRef() as CFArrayRef;
+        let count = unsafe { CFArrayGetCount(array) };
+        let attrs: Vec<String> = (0..count)
+            .filter_map(|i| {
+                let item = unsafe { CFArrayGetValueAtIndex(array, i) };
+                (!item.is_null()).then(|| {
+                    unsafe { CFString::wrap_under_get_rule(item as CFStringRef) }.to_string()
+                })
+            })
+            .collect();
+        out.push_str(&format!("attributes: {attrs:?}\n"));
+    }
+
     let mut budget = 20_000usize;
     dump(app.as_CFTypeRef() as AXUIElementRef, 0, &mut budget, &mut out);
     Ok(out)
+}
+
+pub fn dump_tree() -> Result<String, String> {
+    dump_tree_for("NotificationCenter")
 }
 
 #[tauri::command]
@@ -582,6 +717,16 @@ pub fn get_notifications(expand_stacks: Option<bool>) -> Result<Vec<Notification
 #[tauri::command]
 pub fn click_notification(identifier: String) -> Result<(), String> {
     press_notification(&identifier)
+}
+
+#[tauri::command]
+pub fn open_notification_center() -> Result<(), String> {
+    open_shade()
+}
+
+#[tauri::command]
+pub fn close_notification_center() -> Result<(), String> {
+    close_shade()
 }
 
 #[tauri::command]
