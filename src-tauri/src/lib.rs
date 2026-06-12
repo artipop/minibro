@@ -14,6 +14,7 @@ pub fn run() {
             greet,
             notifications::ax_check_permission,
             notifications::get_notifications,
+            notifications::click_notification,
             notifications::start_notification_watcher,
             notifications::get_notification_log
         ])

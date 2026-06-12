@@ -48,6 +48,7 @@ extern "C" {
         value: *mut CFTypeRef,
     ) -> AXError;
     fn AXUIElementCopyActionNames(element: AXUIElementRef, names: *mut CFArrayRef) -> AXError;
+    fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> AXError;
 
     fn AXObserverCreate(
         pid: i32,
@@ -240,9 +241,8 @@ fn walk(element: AXUIElementRef, depth: usize, budget: &mut usize, out: &mut Vec
     for_each_child(element, |child| walk(child, depth + 1, budget, out));
 }
 
-/// Читает видимые уведомления: баннеры всегда, полный список — когда шторка
-/// Notification Center открыта (окно процесса существует только в эти моменты).
-pub fn read_notifications() -> Result<Vec<NotificationItem>, String> {
+/// Обходит окна NotificationCenter, вызывая `f` для каждого.
+fn for_each_window(mut f: impl FnMut(AXUIElementRef)) -> Result<(), String> {
     if !ax_trusted(false) {
         return Err(
             "Нет разрешения Accessibility. Выдайте его в System Settings → Privacy & Security → Accessibility (в dev-режиме — терминалу, из которого запущено приложение).".into(),
@@ -255,8 +255,6 @@ pub fn read_notifications() -> Result<Vec<NotificationItem>, String> {
     }
     let app = unsafe { CFType::wrap_under_create_rule(app as CFTypeRef) };
 
-    let mut items = Vec::new();
-    let mut budget = 20_000usize;
     if let Some(windows) = copy_attr(app.as_CFTypeRef() as AXUIElementRef, "AXWindows") {
         if windows.type_of() == unsafe { CFArrayGetTypeID() } {
             let array = windows.as_CFTypeRef() as CFArrayRef;
@@ -264,12 +262,116 @@ pub fn read_notifications() -> Result<Vec<NotificationItem>, String> {
             for i in 0..count {
                 let window = unsafe { CFArrayGetValueAtIndex(array, i) } as AXUIElementRef;
                 if !window.is_null() {
-                    walk(window, 0, &mut budget, &mut items);
+                    f(window);
                 }
             }
         }
     }
+    Ok(())
+}
+
+/// Нажимает (AXPress) все свёрнутые стопки, чтобы шторка показала каждое
+/// уведомление отдельно. Возвращает число раскрытых стопок.
+fn expand_stacks_pass() -> Result<usize, String> {
+    fn expand_walk(element: AXUIElementRef, depth: usize, budget: &mut usize, pressed: &mut usize) {
+        if depth > 40 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if let Some(subrole) = attr_string(element, "AXSubrole") {
+            if subrole.starts_with("AXNotificationCenter") && subrole.ends_with("Stack") {
+                let action = CFString::new("AXPress");
+                unsafe { AXUIElementPerformAction(element, action.as_concrete_TypeRef()) };
+                *pressed += 1;
+                return;
+            }
+        }
+        for_each_child(element, |child| expand_walk(child, depth + 1, budget, pressed));
+    }
+
+    let mut pressed = 0;
+    let mut budget = 20_000usize;
+    for_each_window(|window| expand_walk(window, 0, &mut budget, &mut pressed))?;
+    Ok(pressed)
+}
+
+/// Читает видимые уведомления: баннеры всегда, полный список — когда шторка
+/// Notification Center открыта (окно процесса существует только в эти моменты).
+/// С `expand_stacks` предварительно раскрывает свёрнутые стопки — это реальные
+/// клики по шторке, она останется в раскрытом виде.
+pub fn read_notifications_opts(expand_stacks: bool) -> Result<Vec<NotificationItem>, String> {
+    if expand_stacks {
+        // Раскрытие может обнажить новые стопки — повторяем, пока нажимается.
+        for _ in 0..5 {
+            if expand_stacks_pass()? == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500)); // анимация раскрытия
+        }
+    }
+    let mut items = Vec::new();
+    let mut budget = 20_000usize;
+    for_each_window(|window| walk(window, 0, &mut budget, &mut items))?;
     Ok(items)
+}
+
+pub fn read_notifications() -> Result<Vec<NotificationItem>, String> {
+    read_notifications_opts(false)
+}
+
+/// Ищет среди видимых уведомлений (не стопок) элемент с данным AXIdentifier
+/// и нажимает его. Возвращает true, если нашёл и нажал.
+fn try_press_by_id(target: &str) -> Result<bool, String> {
+    fn find(
+        element: AXUIElementRef,
+        depth: usize,
+        budget: &mut usize,
+        target: &str,
+        pressed: &mut bool,
+    ) {
+        if *pressed || depth > 40 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if let Some(subrole) = attr_string(element, "AXSubrole") {
+            if matches!(
+                subrole.as_str(),
+                "AXNotificationCenterAlert" | "AXNotificationCenterBanner"
+            ) && attr_string(element, "AXIdentifier").as_deref() == Some(target)
+            {
+                let action = CFString::new("AXPress");
+                unsafe { AXUIElementPerformAction(element, action.as_concrete_TypeRef()) };
+                *pressed = true;
+                return;
+            }
+        }
+        for_each_child(element, |child| find(child, depth + 1, budget, target, pressed));
+    }
+
+    let mut pressed = false;
+    let mut budget = 20_000usize;
+    for_each_window(|window| find(window, 0, &mut budget, target, &mut pressed))?;
+    Ok(pressed)
+}
+
+/// Находит уведомление по AXIdentifier и кликает по нему (открывает в его
+/// приложении). Если уведомление спрятано в свёрнутой стопке, раскрывает
+/// стопки, пока не найдёт. Работает по видимому: баннер или открытая шторка.
+pub fn press_notification(target: &str) -> Result<(), String> {
+    // У свёрнутой стопки AXIdentifier совпадает с верхним уведомлением, поэтому
+    // прямой клик по стопке не делаем: раскрываем и жмём уже одиночный элемент.
+    for _ in 0..6 {
+        if try_press_by_id(target)? {
+            return Ok(());
+        }
+        if expand_stacks_pass()? == 0 {
+            return Err(format!(
+                "Уведомление {target} не найдено. Видны только баннеры и открытая шторка — проверь, что шторка открыта."
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500)); // анимация раскрытия
+    }
+    Err(format!("Уведомление {target} не найдено после раскрытия стопок"))
 }
 
 // ---------------------------------------------------------------------------
@@ -473,8 +575,13 @@ pub fn ax_check_permission(prompt: bool) -> bool {
 }
 
 #[tauri::command]
-pub fn get_notifications() -> Result<Vec<NotificationItem>, String> {
-    read_notifications()
+pub fn get_notifications(expand_stacks: Option<bool>) -> Result<Vec<NotificationItem>, String> {
+    read_notifications_opts(expand_stacks.unwrap_or(false))
+}
+
+#[tauri::command]
+pub fn click_notification(identifier: String) -> Result<(), String> {
+    press_notification(&identifier)
 }
 
 #[tauri::command]

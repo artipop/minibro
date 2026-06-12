@@ -18,9 +18,9 @@ async function checkAx() {
   axTrusted.value = await invoke("ax_check_permission", { prompt: true });
 }
 
-async function readNotifications() {
+async function readNotifications(expandStacks = false) {
   try {
-    const items = await invoke("get_notifications");
+    const items = await invoke("get_notifications", { expandStacks });
     notificationsDump.value = JSON.stringify(items, null, 2);
   } catch (e) {
     notificationsDump.value = String(e);
@@ -31,6 +31,7 @@ interface LoggedNotification {
   seen_at_ms: number;
   description: string | null;
   texts: string[];
+  identifier: string | null;
 }
 
 const watcherRunning = ref(false);
@@ -53,6 +54,22 @@ async function startWatcher() {
 
 function formatTime(ms: number) {
   return new Date(ms).toLocaleTimeString();
+}
+
+const clickId = ref("");
+const clickResult = ref("");
+
+async function clickNotification(identifier: string | null) {
+  if (!identifier) {
+    clickResult.value = "у этого уведомления нет identifier";
+    return;
+  }
+  try {
+    await invoke("click_notification", { identifier });
+    clickResult.value = `кликнул ${identifier}`;
+  } catch (e) {
+    clickResult.value = String(e);
+  }
 }
 </script>
 
@@ -82,7 +99,8 @@ function formatTime(ms: number) {
     <h2>Уведомления macOS (Accessibility)</h2>
     <div class="row">
       <button @click="checkAx">Проверить доступ</button>
-      <button @click="readNotifications">Прочитать уведомления</button>
+      <button @click="readNotifications()">Прочитать уведомления</button>
+      <button @click="readNotifications(true)">Прочитать с раскрытием стопок</button>
     </div>
     <p v-if="axTrusted !== null">
       Accessibility: {{ axTrusted ? "разрешено" : "нет доступа" }}
@@ -97,11 +115,23 @@ function formatTime(ms: number) {
     </div>
     <p v-if="watcherError">{{ watcherError }}</p>
     <ul v-if="log.length" class="notification-log">
-      <li v-for="(n, i) in log" :key="i">
+      <li
+        v-for="(n, i) in log"
+        :key="i"
+        class="log-item"
+        title="Кликнуть по уведомлению"
+        @click="clickNotification(n.identifier)"
+      >
         <span class="log-time">{{ formatTime(n.seen_at_ms) }}</span>
         {{ n.description ?? n.texts.join(" — ") }}
       </li>
     </ul>
+
+    <form class="row" @submit.prevent="clickNotification(clickId)">
+      <input v-model="clickId" placeholder="AXIdentifier уведомления…" />
+      <button type="submit">Кликнуть по ID</button>
+    </form>
+    <p v-if="clickResult">{{ clickResult }}</p>
   </main>
 </template>
 
@@ -163,6 +193,14 @@ function formatTime(ms: number) {
   max-width: 80%;
   margin: 1em auto;
   padding-left: 1.5em;
+}
+
+.log-item {
+  cursor: pointer;
+}
+
+.log-item:hover {
+  text-decoration: underline;
 }
 
 .log-time {
