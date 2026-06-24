@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, nextTick, watch } from "vue";
+import { ref, nextTick, watch, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { Command, type Child } from "@tauri-apps/plugin-shell";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 type Provider = "openai" | "mlx";
 
@@ -22,7 +22,9 @@ const logEl = ref<HTMLElement | null>(null);
 // Human-in-the-loop state
 const hitlQuestion = ref("");
 const hitlAnswer = ref("");
-let activeChild: Child | null = null;
+
+// Single listener for agent progress events emitted by the Rust backend.
+let unlisten: UnlistenFn | null = null;
 
 function setTrayStatus(status: "idle" | "running" | "alert" | "done") {
   invoke("set_tray_status", { status }).catch(() => {});
@@ -51,125 +53,91 @@ function onModelPreset(p: Provider) {
   model.value = p === "openai" ? "gpt-4o-mini" : MLX_MODELS[0].id;
 }
 
+// Handle one agent progress event (payload shapes match the Rust backend).
+function handleEvent(data: any) {
+  if (!data || typeof data !== "object") return;
+  if (data.step_start !== undefined) {
+    addLog({ type: "step_pending", text: data.step_start, stepId: data.step_id });
+  } else if (data.step_done) {
+    const { id, success, error } = data.step_done;
+    const entry = log.value.find(e => e.stepId === id);
+    if (entry) {
+      entry.type = success ? "step_success" : "step_error";
+      if (error) entry.errorText = error;
+    }
+  } else if (data.step) {
+    const isDebug = (data.step as string).startsWith("[debug]") || (data.step as string).startsWith("[HITL]");
+    addLog({ type: isDebug ? "step_debug" : "step", text: data.step });
+  } else if (data.ask_human) {
+    hitlQuestion.value = data.ask_human;
+    hitlAnswer.value = "";
+    addLog({ type: "ask_human", text: data.ask_human });
+    invoke("show_tray_window").catch(() => {});
+  } else if (data.done) {
+    addLog({ type: "done", text: data.result ?? "Task completed" });
+    running.value = false;
+    hitlQuestion.value = "";
+    setTrayStatus("done");
+  } else if (data.error) {
+    addLog({ type: "error", text: data.error });
+    running.value = false;
+    hitlQuestion.value = "";
+    setTrayStatus("idle");
+  } else if (data.log_error) {
+    addLog({ type: "log_error", text: data.log_error });
+  }
+}
+
+onMounted(async () => {
+  unlisten = await listen<any>("agent://event", (e) => handleEvent(e.payload));
+});
+
+onUnmounted(() => {
+  unlisten?.();
+  unlisten = null;
+});
+
 async function runAgent() {
   if (!task.value.trim() || running.value) return;
   running.value = true;
   hitlQuestion.value = "";
   hitlAnswer.value = "";
   log.value = [];
-  activeChild = null;
-
-  const request = {
-    command: "run_agent",
-    task: task.value.trim(),
-    provider: provider.value,
-    model: model.value,
-    ...(provider.value === "openai"
-      ? { api_key: import.meta.env.VITE_OPENAI_API_KEY ?? "" }
-      : {}),
-  };
 
   setTrayStatus("running");
-  addLog({ type: "step", text: `Spawning sidecar (${provider.value}/${model.value})…` });
-  console.log("[minibro] spawn request:", request);
+  addLog({ type: "step", text: `Starting agent (${provider.value}/${model.value})…` });
 
-  let cmd: ReturnType<typeof Command.sidecar>;
   try {
-    cmd = Command.sidecar("binaries/python-sidecar", [JSON.stringify(request)]);
+    await invoke("run_agent", {
+      task: task.value.trim(),
+      provider: provider.value,
+      model: model.value,
+      apiKey: provider.value === "openai" ? (import.meta.env.VITE_OPENAI_API_KEY ?? "") : null,
+    });
   } catch (err) {
-    addLog({ type: "error", text: `Failed to create command: ${err}` });
+    addLog({ type: "error", text: `Failed to start agent: ${err}` });
     running.value = false;
-    return;
-  }
-
-  cmd.stdout.on("data", (line: string) => {
-    line = line.trim();
-    console.log("[minibro] stdout:", line);
-    if (!line) return;
-    try {
-      const data = JSON.parse(line);
-      if (data.step_start !== undefined) {
-        addLog({ type: "step_pending", text: data.step_start, stepId: data.step_id });
-      } else if (data.step_done) {
-        const { id, success, error } = data.step_done;
-        const entry = log.value.find(e => e.stepId === id);
-        if (entry) {
-          entry.type = success ? "step_success" : "step_error";
-          if (error) entry.errorText = error;
-        }
-      } else if (data.step) {
-        const isDebug = (data.step as string).startsWith("[debug]") || (data.step as string).startsWith("[HITL]");
-        addLog({ type: isDebug ? "step_debug" : "step", text: data.step });
-      } else if (data.ask_human) {
-        hitlQuestion.value = data.ask_human;
-        hitlAnswer.value = "";
-        addLog({ type: "ask_human", text: data.ask_human });
-        invoke("show_tray_window").catch(() => {});
-      } else if (data.done) {
-        addLog({ type: "done", text: data.result ?? "Task completed" });
-        running.value = false;
-        hitlQuestion.value = "";
-        setTrayStatus("done");
-      } else if (data.error) {
-        addLog({ type: "error", text: data.error });
-        running.value = false;
-        hitlQuestion.value = "";
-      } else if (data.log_error) {
-        addLog({ type: "log_error", text: data.log_error });
-      } else {
-        addLog({ type: "step", text: `[raw] ${line}` });
-      }
-    } catch {
-      addLog({ type: "step", text: `[raw] ${line}` });
-    }
-  });
-
-  cmd.stderr.on("data", (line: string) => {
-    console.warn("[minibro] stderr:", line.trim());
-  });
-
-  cmd.on("close", (data) => {
-    console.log("[minibro] process closed, code:", data?.code);
-    addLog({ type: "step", text: `Process exited (code ${data?.code ?? "?"})` });
-    running.value = false;
-    hitlQuestion.value = "";
-    activeChild = null;
     setTrayStatus("idle");
-  });
-
-  cmd.on("error", (err) => {
-    console.error("[minibro] process error:", err);
-    addLog({ type: "error", text: `Spawn error: ${err}` });
-    running.value = false;
-    hitlQuestion.value = "";
-    activeChild = null;
-  });
-
-  try {
-    activeChild = await cmd.spawn();
-    console.log("[minibro] spawned pid:", activeChild.pid);
-    addLog({ type: "step", text: `Sidecar started (pid ${activeChild.pid})` });
-  } catch (err) {
-    console.error("[minibro] spawn failed:", err);
-    addLog({ type: "error", text: `Spawn failed: ${err}` });
-    running.value = false;
   }
 }
 
 async function sendHitlAnswer() {
-  if (!activeChild || !hitlAnswer.value.trim()) return;
+  if (!hitlAnswer.value.trim()) return;
   const answer = hitlAnswer.value.trim();
   addLog({ type: "user_reply", text: answer });
-  await activeChild.write(answer + "\n");
+  await invoke("hitl_reply", { answer }).catch((err) =>
+    addLog({ type: "error", text: `Failed to send reply: ${err}` })
+  );
   hitlQuestion.value = "";
   hitlAnswer.value = "";
   setTrayStatus("running");
 }
 
 function stopAgent() {
-  activeChild?.kill().catch(() => {});
+  invoke("agent_stop").catch(() => {});
   running.value = false;
   hitlQuestion.value = "";
+  setTrayStatus("idle");
 }
 
 function badgeLabel(entry: LogEntry): string {

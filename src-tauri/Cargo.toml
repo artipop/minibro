@@ -20,12 +20,13 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", default-features = false, features = ["cef", "tray-icon"] }
 tauri-plugin-opener = "2"
-tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3.3.0", features = ["json"] }
 tungstenite = "0.29.0"
 image = { version = "0.25", default-features = false, features = ["png"] }
+agent = { path = "../src-agent" }
+tokio = { version = "1", features = ["sync", "rt"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

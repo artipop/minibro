@@ -5,14 +5,6 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [{ "name": "binaries/python-sidecar", "sidecar": true, "args": true }]
-    },
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [{ "name": "binaries/python-sidecar", "sidecar": true, "args": true }]
-    }
+    "opener:default"
   ]
 }

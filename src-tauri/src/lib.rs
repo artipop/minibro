@@ -1,8 +1,10 @@
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
+    Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder,
 };
+use tokio::sync::mpsc;
 
 /// Hide the native traffic-light buttons (close/minimize/zoom).
 /// Must be called on the main thread. Safe to call in setup().
@@ -28,7 +30,76 @@ struct TrayShown(Mutex<bool>);
 struct HitlActive(Mutex<bool>);
 struct TrayHandle(Mutex<Option<tauri::tray::TrayIcon<tauri::Cef>>>);
 
+/// Controls for the in-process browser agent: a channel to deliver
+/// human-in-the-loop answers and a flag to cancel the running task.
+#[derive(Default)]
+struct AgentControl {
+    hitl_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    cancel: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+/// CDP port the tray browser is launched with (see `command_line_args`).
+const TRAY_CDP_PORT: u16 = 9229;
+
 // ── Tauri commands ────────────────────────────────────────────────────────────
+
+/// Start a browser-agent task. Progress is streamed to the frontend as
+/// `agent://event` events whose payloads match the legacy NDJSON shapes
+/// (step/step_start/step_done/ask_human/done/error). HITL answers come back via
+/// `hitl_reply`; `agent_stop` cancels.
+#[tauri::command]
+fn run_agent(
+    app: tauri::AppHandle<tauri::Cef>,
+    task: String,
+    provider: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<(), String> {
+    use agent::{run_agent as run_agent_core, Config, FnEvents};
+
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
+    let cancel = Arc::new(AtomicBool::new(false));
+
+    {
+        let ctrl = app.state::<AgentControl>();
+        *ctrl.hitl_tx.lock().unwrap() = Some(tx);
+        *ctrl.cancel.lock().unwrap() = Some(cancel.clone());
+    }
+
+    let emit_app = app.clone();
+    let events = Arc::new(FnEvents(move |v: serde_json::Value| {
+        let _ = emit_app.emit("agent://event", v);
+    }));
+
+    let cfg = Config {
+        task,
+        provider,
+        model,
+        api_key,
+        cdp_port: TRAY_CDP_PORT,
+    };
+
+    tauri::async_runtime::spawn(async move {
+        run_agent_core(cfg, events, rx, cancel).await;
+    });
+    Ok(())
+}
+
+/// Deliver one human-in-the-loop answer to the running agent.
+#[tauri::command]
+fn hitl_reply(app: tauri::AppHandle<tauri::Cef>, answer: String) {
+    if let Some(tx) = app.state::<AgentControl>().hitl_tx.lock().unwrap().as_ref() {
+        let _ = tx.send(answer);
+    }
+}
+
+/// Cancel the running agent task.
+#[tauri::command]
+fn agent_stop(app: tauri::AppHandle<tauri::Cef>) {
+    if let Some(c) = app.state::<AgentControl>().cancel.lock().unwrap().as_ref() {
+        c.store(true, Ordering::Relaxed);
+    }
+}
 
 #[tauri::command]
 fn show_tray_window(app: tauri::AppHandle<tauri::Cef>) -> Result<(), String> {
@@ -179,12 +250,17 @@ fn cdp_find_tray_ws() -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::<tauri::Cef>::new()
-        .command_line_args([("remote-debugging-port", Some("9229"))])
+        .command_line_args([
+            ("remote-debugging-port", Some("9229")),
+            // Allow the agent-browser CLI to open a CDP WebSocket to the tray
+            // browser. Chromium (M111+) rejects external CDP clients without it.
+            ("remote-allow-origins", Some("*")),
+        ])
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_shell::init())
         .manage(TrayShown(Mutex::new(false)))
         .manage(HitlActive(Mutex::new(false)))
         .manage(TrayHandle(Mutex::new(None)))
+        .manage(AgentControl::default())
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -307,6 +383,9 @@ pub fn run() {
             cdp_eval,
             cdp_get_html,
             cdp_list_targets,
+            run_agent,
+            hitl_reply,
+            agent_stop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
